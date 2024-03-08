@@ -1,0 +1,15 @@
+[package]
+name = "bfjit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.80"
+clap = { version = "4.5.2", features = ["derive"] }
+#memmap2 = "0.9.4"
+
+[profile.release]
+#debug = true
+strip = true
+lto = true
+opt-level = "z"
