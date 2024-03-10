@@ -1,12 +1,12 @@
 mod scanner;
 
 use std::{
-    collections::HashMap,
     io::{stdin, stdout, Write},
     path::PathBuf,
 };
 
 use clap::{Parser, ValueEnum};
+use memmap2::Mmap;
 use scanner::{BfCompiler, OpCode};
 
 #[derive(Debug, Parser)]
@@ -47,15 +47,14 @@ fn main() -> anyhow::Result<()> {
     );
     measure!("optimizing", optimize(&mut ops));
     measure!("back patching", back_patch(&mut ops));
-    //measure!("running", interpret(&ops, args.cells));
-    /*
-    let code = jit(&ops);
-    for (i, c) in code.iter().enumerate() {
-        println!("{:06}: {:#04x}", i, c);
+
+    match args.run {
+        RunKind::Interpret => measure!("interpret", interpret(&ops, args.cells)),
+        RunKind::Jit => {
+            let code = measure!("jit compile", jit(&ops));
+            measure!("jit run", Runner::new(code).exec(args.cells))
+        }
     }
-    */
-    let runner = Runner::new(jit(&ops));
-    runner.exec();
 
     Ok(())
 }
@@ -184,174 +183,105 @@ fn interpret(ops: &[OpCode], cell_count: usize) {
 //type Runner = fn(cells: *mut u8, len: usize);
 
 struct Runner {
-    code: *const u8,
-    len: usize,
+    map: Mmap,
 }
 
-type JitFunc = fn(*mut u8, usize);
+type JitFunc = fn(*mut u8);
 
 impl Runner {
     fn new(code: Vec<u8>) -> Self {
-        /*
-                let mut map = memmap2::MmapMut::map_anon(code.len()).unwrap();
-                map.copy_from_slice(&code);
-                let map = map.make_exec().unwrap();
-        */
-        /*
-        let code_box = code.into_boxed_slice();
-        let len = code_box.len();
-        let leaked_code = Box::into_raw(code_box) as *mut u8;
-        */
-        let code = [ret()];
-        let len = code.len();
-        let code_ptr = code.as_ptr();
-        let code = unsafe {
-            let page = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                -1,
-                0,
-            );
-
-            /*
-            let mut page: *mut libc::c_void = std::ptr::null_mut();
-            libc::posix_memalign(&mut page, 4096, len);
-            libc::mprotect(
-                page,
-                len,
-                libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE,
-            );
-            */
-            libc::memcpy(page, code_ptr as *const libc::c_void, len);
-
-            page as *mut u8
-            /*
-            libc::mprotect(
-                leaked_code as *mut libc::c_void,
-                len,
-                libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE,
-            );
-            */
-        };
-
-        Self { code, len }
+        let mut map = memmap2::MmapMut::map_anon(code.len()).unwrap();
+        map.copy_from_slice(&code);
+        let map = map.make_exec().unwrap();
+        Self { map }
     }
 
     fn as_func(&self) -> JitFunc {
-        unsafe { std::mem::transmute(self.code) }
+        unsafe { std::mem::transmute(self.map.as_ptr()) }
     }
 
-    fn exec(&self) {
-        let mut cells = vec![0u8; 30000];
-        let func = self.as_func();
-        let raw_cells = cells.as_mut_ptr();
-        let cells_len = cells.len();
-        func(raw_cells, cells_len);
-    }
-}
-
-impl Drop for Runner {
-    fn drop(&mut self) {
-        unsafe {
-            let slice: &mut [u8] = std::slice::from_raw_parts_mut(self.code as *mut u8, self.len);
-            _ = Box::from_raw(slice);
+    fn exec(&self, cell_count: usize) {
+        let mut cells = vec![0u8; cell_count];
+        {
+            let func = self.as_func();
+            let raw_cells = cells.as_mut_ptr();
+            //println!("{:?}", raw_cells);
+            func(raw_cells);
         }
+        for c in cells {
+            if c != 0 {
+                print!("{}", c as char);
+            }
+        }
+        println!();
     }
 }
 
 /// Registers:
-/// rsi: cells array
-/// rdi: length of cells array
+/// rdi: cells array
+/// rsi: length of cells array
 /// rbx: current cell
 
 const fn move_cell_right(count: u8) -> [u8; 4] {
-    let mut operation = [0u8; 4];
-    // 64bit operation
-    operation[0] = 0x48;
-    // add operation
-    operation[1] = 0x83;
-    // rbx register
-    operation[2] = 0xc3;
-    operation[3] = count;
-
-    operation
+    [
+        0x48, // 64bit operation
+        0x83, // add operation
+        0xc3, // rbx register
+        count,
+    ]
 }
 
 const fn move_cell_left(count: u8) -> [u8; 4] {
-    let mut operation = [0u8; 4];
-    // 64bit operation
-    operation[0] = 0x48;
-    // sub operation
-    operation[1] = 0x83;
-    // rbx register
-    operation[2] = 0xeb;
-    operation[3] = count;
-
-    operation
+    [
+        0x48, // 64bit operation
+        0x83, // sub operation
+        0xeb, // rbx register
+        count,
+    ]
 }
 
 const fn add_current_cell(count: u8) -> [u8; 4] {
-    let mut operation = [0u8; 4];
-    // add operation
-    operation[0] = 0x80;
-    // sib register
-    operation[1] = 0x04;
-    // rbx + rsi
-    operation[2] = 0x1e;
-    operation[3] = count;
-
-    operation
+    [
+        0x80, // add operation
+        0x04, // sib register
+        0x1f, // rbx + rdi
+        count,
+    ]
 }
 
 const fn sub_current_cell(count: u8) -> [u8; 4] {
-    let mut operation = [0u8; 4];
-    // add operation
-    operation[0] = 0x80;
-    // sib register
-    operation[1] = 0x2c;
-    // rbx + rsi
-    operation[2] = 0x1e;
-    operation[3] = count;
-
-    operation
-}
-
-const fn init_rbx() -> [u8; 7] {
-    let mut operation = [0u8; 7];
-    //\x48\xc7\xc3
-
-    // 64bit operation
-    operation[0] = 0x48;
-    // mov operation
-    operation[1] = 0xc7;
-    // rbx register
-    operation[2] = 0xc3;
-    // data
-    operation[3] = 0x0;
-    operation[4] = 0x0;
-    operation[5] = 0x0;
-    operation[6] = 0x0;
-
-    operation
-}
-
-/// this is only the opcode, back patching is needed
-const fn jump_if_zero() -> [u8; 7] {
     [
-        0x8a, 0x04, 0x1e, // move current cell into al
-        0x84, 0xc0, // test al
-        0x74, 0x00, // jump if al is zero
+        0x80, // add operation
+        0x2c, // sib register
+        0x1f, // rbx + rdi
+        count,
+    ]
+}
+
+const fn init_rbx() -> [u8; 3] {
+    // sets rbx to 0
+    [
+        0x48, // 64bit op
+        0x31, // xor
+        0xdb, // rbx
     ]
 }
 
 /// this is only the opcode, back patching is needed
-const fn jump_if_not_zero() -> [u8; 7] {
+const fn jump_if_zero() -> [u8; 11] {
     [
-        0x8a, 0x04, 0x1e, // move current cell into al
+        0x8a, 0x04, 0x1f, // move current cell into al
         0x84, 0xc0, // test al
-        0x75, 0x00, // jump if al is zero
+        0x0f, 0x84, 0x00, 0x00, 0x00, 0x00, // jump if al is zero
+    ]
+}
+
+/// this is only the opcode, back patching is needed
+const fn jump_if_not_zero() -> [u8; 11] {
+    [
+        0x8a, 0x04, 0x1f, // move current cell into al
+        0x84, 0xc0, // test al
+        0x0f, 0x85, 0x00, 0x00, 0x00, 0x00, // jump if al is zero
     ]
 }
 
@@ -359,7 +289,7 @@ const fn write_to_current_cell(value: u8) -> [u8; 4] {
     [
         0xc6, // mov op
         0x04, // indicates sib register, seems to mean a combinations register
-        0x1e, //sib register of rbx + rsi (in this case, index into array)
+        0x1f, //sib register of rbx + rdi (in this case, index into array)
         value,
     ]
 }
@@ -369,20 +299,10 @@ const fn ret() -> u8 {
 }
 
 const fn print_current_cell() -> [u8; 13] {
-    /*
-    53                      push   %rbx
-    b2 01                   mov    $0x1,%dl
-    8a 0c 37                mov    (%rdi,%rsi,1),%cl
-    b3 01                   mov    $0x1,%bl
-    b0 04                   mov    $0x4,%al
-    cd 80                   int    $0x80
-    5b                      pop    %rbx
-    */
-
     [
         0x53, // push current rbx to stack
         0xb2, 0x01, // set bl(rdx) to 1 (length of data to be printed)
-        0x8a, 0x0c, 0x37, // mov current cell to cl (rcx)
+        0x8a, 0x0c, 0x1f, // mov current cell to cl (rcx)
         0xb3, 0x01, // set bl (rbx) to 1 (stdout file descriptor)
         0xb0, 0x04, // set al (rax) to 4 (write syscall)
         0xcd, 0x80, // make a system call
@@ -418,15 +338,22 @@ fn jit(ops: &[OpCode]) -> Vec<u8> {
             OpCode::JumpIfZero { .. } => {
                 code.extend(jump_if_zero());
                 // push the location of the jump target on the back patch stack
-                back_patch_stack.push(code.len() - 1);
+                back_patch_stack.push(code.len());
             }
             OpCode::JumpIfNotZero { .. } => {
                 code.extend(jump_if_not_zero());
                 let target = back_patch_stack.pop().expect("Closing ] without [");
-                // set the jez target after the jz target
-                *code.last_mut().unwrap() = (code.len() - target) as u8 + 1;
+                let offset = code.len() - target;
+
+                // setup jump to after the jz target
+                let jump = u32::MAX - (offset as u32) + 1;
+                let bytes = jump.to_ne_bytes();
+                let len = code.len();
+                code[len - 4..].copy_from_slice(&bytes);
+
                 // set jz target to byte after jez
-                code[target] = (code.len() - target) as u8;
+                let bytes = ((code.len() - target) as u32).to_ne_bytes();
+                code[target - 4..target].copy_from_slice(&bytes);
             }
             OpCode::SetZero => {
                 code.extend(write_to_current_cell(0x0));
