@@ -1,7 +1,7 @@
 mod scanner;
 
 use std::{
-    io::{stdin, stdout, Write},
+    io::{stdin, stdout, BufRead, Write},
     path::PathBuf,
 };
 
@@ -180,13 +180,11 @@ fn interpret(ops: &[OpCode], cell_count: usize) {
     out.flush().unwrap();
 }
 
-//type Runner = fn(cells: *mut u8, len: usize);
-
 struct Runner {
     map: Mmap,
 }
 
-type JitFunc = fn(*mut u8);
+type JitFunc = fn(*mut u8, &mut dyn FnMut(u8), &mut dyn FnMut() -> u8);
 
 impl Runner {
     fn new(code: Vec<u8>) -> Self {
@@ -202,24 +200,37 @@ impl Runner {
 
     fn exec(&self, cell_count: usize) {
         let mut cells = vec![0u8; cell_count];
-        {
-            let func = self.as_func();
-            let raw_cells = cells.as_mut_ptr();
-            //println!("{:?}", raw_cells);
-            func(raw_cells);
-        }
-        for c in cells {
-            if c != 0 {
-                print!("{}", c as char);
+        let func = self.as_func();
+        let raw_cells = cells.as_mut_ptr();
+
+        let stdout = stdout();
+        let mut stdout = stdout.lock();
+        let mut print_func = |byte: u8| {
+            _ = stdout.write(&[byte]).unwrap();
+        };
+
+        let stdin = stdin();
+        let mut stdin = stdin.lock();
+        let mut buffer = Vec::new();
+        let mut scan_func = || {
+            if buffer.is_empty() {
+                _ = stdin.read_until(b'\n', &mut buffer).unwrap();
+                buffer.push(b'\0');
             }
-        }
-        println!();
+
+            let val = buffer[0];
+            buffer.remove(0);
+            val
+        };
+
+        func(raw_cells, &mut print_func, &mut scan_func);
+        _ = stdout.write(b"\n").unwrap();
+        stdout.flush().unwrap();
     }
 }
 
 /// Registers:
 /// rdi: cells array
-/// rsi: length of cells array
 /// rbx: current cell
 
 const fn move_cell_right(count: u8) -> [u8; 4] {
@@ -258,9 +269,11 @@ const fn sub_current_cell(count: u8) -> [u8; 4] {
     ]
 }
 
-const fn init_rbx() -> [u8; 3] {
+const fn init() -> [u8; 5] {
     // sets rbx to 0
     [
+        0x50, // push rax
+        0x53, // push rbx
         0x48, // 64bit op
         0x31, // xor
         0xdb, // rbx
@@ -294,26 +307,95 @@ const fn write_to_current_cell(value: u8) -> [u8; 4] {
     ]
 }
 
-const fn ret() -> u8 {
-    0xc3
+const fn finish() -> [u8; 3] {
+    [
+        0x5b, // pop rbx
+        0x58, // pop rax
+        0xc3, // ret
+    ]
 }
 
-const fn print_current_cell() -> [u8; 13] {
+const fn print_current_cell() -> [u8; 29] {
+    /*
+    50                      push   %rax
+    53                      push   %rbx
+    57                      push   %rdi
+    56                      push   %rsi
+    52                      push   %rdx
+    51                      push   %rcx
+    41 50                   push   %r8
+
+    48 89 f0                mov    %rsi,%rax
+    0f b6 34 1f             movzbl (%rdi,%rbx,1),%esi
+    48 89 c7                mov    %rax,%rdi
+    ff 52 20                call   *0x20(%rdx)
+
+    41 58                   pop    %r8
+    59                      pop    %rcx
+    5a                      pop    %rdx
+    5e                      pop    %rsi
+    5f                      pop    %rdi
+    5b                      pop    %rbx
+    58                      pop    %rax
+    */
+
     [
-        0x53, // push current rbx to stack
-        0xb2, 0x01, // set bl(rdx) to 1 (length of data to be printed)
-        0x8a, 0x0c, 0x1f, // mov current cell to cl (rcx)
-        0xb3, 0x01, // set bl (rbx) to 1 (stdout file descriptor)
-        0xb0, 0x04, // set al (rax) to 4 (write syscall)
-        0xcd, 0x80, // make a system call
-        0x5b, // pop rbx from the stack
+        0x50, 0x53, 0x57, 0x56, 0x52, 0x51, // push rax, rbx, rdi, rsi, rdx, rcx
+        0x41, 0x50, // push r8
+        //
+        //
+        0x48, 0x89, 0xf0, // move rsi to rax
+        0x0f, 0xb6, 0x34, 0x1f, // move current cell to esi(rsi)
+        0x48, 0x89, 0xc7, // move rax to rdi
+        0xff, 0x52, 0x20, // call rdx + 32 ( function )
+        //
+        //
+        0x41, 0x58, // pop r8
+        0x59, 0x5a, 0x5e, 0x5f, 0x5b, 0x58, // pop rcx, rdx, rsi, rdi, rbx, rax
+    ]
+}
+
+const fn scan_current_cell() -> [u8; 28] {
+    /*
+    50                      push   %rax
+    56                      push   %rsi
+    52                      push   %rdx
+    51                      push   %rcx
+    41 50                   push   %r8
+    52                      push   %rdx
+    53                      push   %rbx
+    57                      push   %rdi
+    48 89 cf                mov    %rcx,%rdi
+    41 ff 50 20             call   *0x20(%r8)
+    5f                      pop    %rdi
+    5b                      pop    %rbx
+    88 04 1f                mov    %al,(%rdi,%rbx,1)
+    5a                      pop    %rdx
+    41 58                   pop    %r8
+    59                      pop    %rcx
+    5a                      pop    %rdx
+    5e                      pop    %rsi
+    58                      pop    %rax
+    */
+    [
+        0x50, 0x56, 0x52, 0x51, // push rax, rsi, rdx, rcx
+        0x41, 0x50, // push r8
+        0x52, // push rdx
+        0x53, 0x57, // push rbx, rdi
+        0x48, 0x89, 0xcf, // move rcx (function object pointer) to rdi
+        0x41, 0xff, 0x50, 0x20, // call the scan function
+        0x5f, 0x5b, // pop rdi, rbx
+        0x88, 0x04, 0x1f, // move al (rax/return value) into current cell
+        0x5a, // pop rdx
+        0x41, 0x58, // pop r8
+        0x59, 0x5a, 0x5e, 0x58, // pop rcx, rdx, rsi, rax
     ]
 }
 
 fn jit(ops: &[OpCode]) -> Vec<u8> {
     let mut back_patch_stack: Vec<usize> = Vec::new();
     let mut code: Vec<u8> = Vec::new();
-    code.extend(init_rbx());
+    code.extend(init());
     for op in ops {
         match op {
             OpCode::Right { count } => {
@@ -332,8 +414,7 @@ fn jit(ops: &[OpCode]) -> Vec<u8> {
                 code.extend(print_current_cell());
             }
             OpCode::Input => {
-                // TODO: implement
-                code.push(0xFE);
+                code.extend(scan_current_cell());
             }
             OpCode::JumpIfZero { .. } => {
                 code.extend(jump_if_zero());
@@ -361,6 +442,6 @@ fn jit(ops: &[OpCode]) -> Vec<u8> {
         }
     }
 
-    code.push(ret());
+    code.extend(finish());
     code
 }
