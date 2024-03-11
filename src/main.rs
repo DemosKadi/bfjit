@@ -24,6 +24,14 @@ enum RunKind {
     Jit,
 }
 
+#[cfg(test)]
+macro_rules! measure {
+    ($name:expr, $code: expr) => {
+        $code
+    };
+}
+
+#[cfg(not(test))]
 macro_rules! measure {
     ($name:expr, $code: expr) => {{
         let now = std::time::Instant::now();
@@ -41,22 +49,57 @@ fn main() -> anyhow::Result<()> {
 
     let code = std::fs::read(args.path)?;
 
-    let mut ops = measure!(
-        "compiling",
-        BfCompiler::new(trim(&code)).collect::<Vec<_>>()
-    );
-    measure!("optimizing", optimize(&mut ops));
-    measure!("back patching", back_patch(&mut ops));
+    let ops = compile(&code);
 
     match args.run {
         RunKind::Interpret => measure!("interpret", interpret(&ops, args.cells)),
-        RunKind::Jit => {
-            let code = measure!("jit compile", jit(&ops));
-            measure!("jit run", Runner::new(code).exec(args.cells))
-        }
+        RunKind::Jit => run_jit(&ops, args.cells),
     }
 
     Ok(())
+}
+
+fn run_jit(ops: &[OpCode], cells: usize) {
+    let out = stdout();
+    let mut out = out.lock();
+    let mut print = |value| {
+        _ = out.write(&[value]).unwrap();
+    };
+
+    let mut buffer = Vec::new();
+    let input = stdin();
+    let mut input = input.lock();
+    let mut scan = || {
+        if buffer.is_empty() {
+            _ = input.read_until(b'\n', &mut buffer).unwrap();
+            buffer.push(b'\0');
+        }
+
+        let val = buffer[0];
+        buffer.remove(0);
+        val
+    };
+
+    run_jit_with_io(ops, cells, &mut print, &mut scan);
+    _ = out.write(&[b'\n']).unwrap();
+    out.flush().unwrap();
+}
+
+fn run_jit_with_io(
+    ops: &[OpCode],
+    cells: usize,
+    print: &mut dyn FnMut(u8),
+    scan: &mut dyn FnMut() -> u8,
+) {
+    let code = measure!("jit compile", jit(ops));
+    measure!("jit run", Runner::new(code, print, scan).exec(cells));
+}
+
+fn compile(code: &[u8]) -> Vec<OpCode> {
+    let mut ops = measure!("compiling", BfCompiler::new(trim(code)).collect::<Vec<_>>());
+    measure!("optimizing", optimize(&mut ops));
+    measure!("back patching", back_patch(&mut ops));
+    ops
 }
 
 fn trim(input: &[u8]) -> &[u8] {
@@ -124,12 +167,15 @@ fn optimize(ops: &mut Vec<OpCode>) {
     }
 }
 
-fn interpret(ops: &[OpCode], cell_count: usize) {
+fn interpret_with_custom_io(
+    ops: &[OpCode],
+    cell_count: usize,
+    print: &mut dyn FnMut(u8),
+    scan: &mut dyn FnMut() -> u8,
+) {
     let mut ip = 0usize;
     let mut cell = 0usize;
     let mut cells = vec![0u8; cell_count];
-    let mut input = String::new();
-    let mut out = stdout();
 
     while ip < ops.len() {
         let op = ops[ip];
@@ -151,18 +197,11 @@ fn interpret(ops: &[OpCode], cell_count: usize) {
                 ip += 1;
             }
             OpCode::Output => {
-                _ = out.write(&[cells[cell]]).unwrap();
+                print(cells[cell]);
                 ip += 1;
             }
             OpCode::Input => {
-                if input.is_empty() {
-                    stdin().read_line(&mut input).unwrap();
-                    input.push('\0');
-                }
-
-                cells[cell] = input.as_bytes()[0];
-                input = String::from(&input[1..]);
-
+                cells[cell] = scan();
                 ip += 1;
             }
             OpCode::JumpIfZero { target } => {
@@ -177,55 +216,64 @@ fn interpret(ops: &[OpCode], cell_count: usize) {
             }
         }
     }
+}
+
+fn interpret(ops: &[OpCode], cell_count: usize) {
+    let out = stdout();
+    let mut out = out.lock();
+    let mut print = |value| {
+        _ = out.write(&[value]).unwrap();
+    };
+
+    let mut buffer = Vec::new();
+    let input = stdin();
+    let mut input = input.lock();
+    let mut scan = || {
+        if buffer.is_empty() {
+            _ = input.read_until(b'\n', &mut buffer).unwrap();
+            buffer.push(b'\0');
+        }
+
+        let val = buffer[0];
+        buffer.remove(0);
+        val
+    };
+
+    interpret_with_custom_io(ops, cell_count, &mut print, &mut scan);
+    _ = out.write(&[b'\n']).unwrap();
     out.flush().unwrap();
 }
 
-struct Runner {
+struct Runner<'print, 'scan> {
     map: Mmap,
+    print: &'print mut dyn FnMut(u8),
+    scan: &'scan mut dyn FnMut() -> u8,
 }
 
 type JitFunc = fn(*mut u8, &mut dyn FnMut(u8), &mut dyn FnMut() -> u8);
 
-impl Runner {
-    fn new(code: Vec<u8>) -> Self {
+impl<'print, 'scan> Runner<'print, 'scan> {
+    fn new(
+        code: Vec<u8>,
+        print: &'print mut dyn FnMut(u8),
+        scan: &'scan mut dyn FnMut() -> u8,
+    ) -> Self {
         let mut map = memmap2::MmapMut::map_anon(code.len()).unwrap();
         map.copy_from_slice(&code);
         let map = map.make_exec().unwrap();
-        Self { map }
+        Self { map, print, scan }
     }
 
     fn as_func(&self) -> JitFunc {
         unsafe { std::mem::transmute(self.map.as_ptr()) }
     }
 
-    fn exec(&self, cell_count: usize) {
+    fn exec(&mut self, cell_count: usize) {
         let mut cells = vec![0u8; cell_count];
         let func = self.as_func();
         let raw_cells = cells.as_mut_ptr();
 
-        let stdout = stdout();
-        let mut stdout = stdout.lock();
-        let mut print_func = |byte: u8| {
-            _ = stdout.write(&[byte]).unwrap();
-        };
-
-        let stdin = stdin();
-        let mut stdin = stdin.lock();
-        let mut buffer = Vec::new();
-        let mut scan_func = || {
-            if buffer.is_empty() {
-                _ = stdin.read_until(b'\n', &mut buffer).unwrap();
-                buffer.push(b'\0');
-            }
-
-            let val = buffer[0];
-            buffer.remove(0);
-            val
-        };
-
-        func(raw_cells, &mut print_func, &mut scan_func);
-        _ = stdout.write(b"\n").unwrap();
-        stdout.flush().unwrap();
+        func(raw_cells, &mut self.print, &mut self.scan);
     }
 }
 
@@ -444,4 +492,37 @@ fn jit(ops: &[OpCode]) -> Vec<u8> {
 
     code.extend(finish());
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{compile, interpret_with_custom_io, run_jit_with_io};
+
+    #[test]
+    fn code_interpret() {
+        let code = b",++++++++++.";
+        let ops = compile(code);
+
+        let mut print_buffer = Vec::new();
+        interpret_with_custom_io(
+            &ops,
+            30000,
+            &mut |value| print_buffer.push(value),
+            &mut || 12,
+        );
+    }
+
+    #[test]
+    fn code_jit() {
+        let code = b",++++++++++.";
+        let ops = compile(code);
+
+        let mut print_buffer = Vec::new();
+        run_jit_with_io(
+            &ops,
+            30000,
+            &mut |value| print_buffer.push(value),
+            &mut || 12,
+        );
+    }
 }
