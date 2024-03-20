@@ -1,3 +1,4 @@
+mod cljit;
 mod scanner;
 
 use std::{
@@ -22,6 +23,7 @@ struct Args {
 enum RunKind {
     Interpret,
     Jit,
+    CraneLift,
 }
 
 #[cfg(test)]
@@ -54,6 +56,7 @@ fn main() -> anyhow::Result<()> {
     match args.run {
         RunKind::Interpret => measure!("interpret", interpret(&ops, args.cells)),
         RunKind::Jit => run_jit(&ops, args.cells),
+        RunKind::CraneLift => run_cranelift(&ops, args.cells),
     }
 
     Ok(())
@@ -93,6 +96,39 @@ fn run_jit_with_io(
 ) {
     let code = measure!("jit compile", jit(ops));
     measure!("jit run", Runner::new(code, print, scan).exec(cells));
+}
+
+fn run_cranelift(ops: &[OpCode], cells: usize) {
+    let out = stdout();
+    let mut out = out.lock();
+    let mut print = |value| {
+        _ = out.write(&[value]).unwrap();
+    };
+
+    let mut buffer = Vec::new();
+    let input = stdin();
+    let mut input = input.lock();
+    let mut scan = || {
+        if buffer.is_empty() {
+            _ = input.read_until(b'\n', &mut buffer).unwrap();
+            buffer.push(b'\0');
+        }
+
+        let val = buffer[0];
+        buffer.remove(0);
+        val
+    };
+
+    let code = measure!("cranelift compile", cljit::compile(ops)).unwrap();
+    let cells = measure!(
+        "cranelift run",
+        Runner::new(code, &mut print, &mut scan).exec(cells)
+    );
+
+    _ = out.write(&[b'\n']).unwrap();
+    out.flush().unwrap();
+
+    dbg!(&cells[..6]);
 }
 
 fn compile(code: &[u8]) -> Vec<OpCode> {
@@ -268,12 +304,14 @@ impl<'print, 'scan> Runner<'print, 'scan> {
         unsafe { std::mem::transmute(self.map.as_ptr()) }
     }
 
-    fn exec(&mut self, cell_count: usize) {
+    fn exec(&mut self, cell_count: usize) -> Vec<u8> {
         let mut cells = vec![0u8; cell_count];
         let func = self.as_func();
         let raw_cells = cells.as_mut_ptr();
 
         func(raw_cells, &mut self.print, &mut self.scan);
+
+        cells
     }
 }
 
