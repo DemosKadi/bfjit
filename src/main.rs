@@ -120,15 +120,13 @@ fn run_cranelift(ops: &[OpCode], cells: usize) {
     };
 
     let code = measure!("cranelift compile", cljit::compile(ops)).unwrap();
-    let cells = measure!(
+    let _cells = measure!(
         "cranelift run",
         Runner::new(code, &mut print, &mut scan).exec(cells)
     );
 
     _ = out.write(&[b'\n']).unwrap();
     out.flush().unwrap();
-
-    dbg!(&cells[..6]);
 }
 
 fn compile(code: &[u8]) -> Vec<OpCode> {
@@ -311,6 +309,7 @@ impl<'print, 'scan> Runner<'print, 'scan> {
 
         func(raw_cells, &mut self.print, &mut self.scan);
 
+        dbg!(&cells[..6]);
         cells
     }
 }
