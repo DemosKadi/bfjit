@@ -1,4 +1,4 @@
-use crate::{measure, printer_function, scanner::OpCode, scanner_function, JitFunc, Runner};
+use crate::{printer_function, scanner::OpCode, scanner_function, JitFunc, Measured, Runner};
 
 pub struct Jit;
 
@@ -8,12 +8,14 @@ impl Runner for Jit {
         cells: &mut [u8],
         printer: &mut crate::Printer,
         scanner: &mut crate::Scanner,
-    ) {
-        let code = measure!("jit compile", jit(ops));
+    ) -> Measured<()> {
+        let mut m = Measured::new();
+
+        let code = m.measure("jit compile", || jit(ops));
         let mut map = memmap2::MmapMut::map_anon(code.len()).unwrap();
         map.copy_from_slice(&code);
         let map = map.make_exec().unwrap();
-        measure!("jit run", {
+        m.measure("jit run", || {
             let printer = printer as *mut crate::Printer;
             let scanner = scanner as *mut crate::Scanner;
             let func: JitFunc = unsafe { std::mem::transmute((&map).as_ptr()) };
@@ -21,6 +23,8 @@ impl Runner for Jit {
 
             func(cells, printer, printer_function, scanner, scanner_function);
         });
+
+        m
     }
 }
 

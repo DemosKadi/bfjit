@@ -1,12 +1,16 @@
 use crate::{
-    measure,
     scanner::{BfCompiler, OpCode},
+    Measured,
 };
 
-pub fn compile(code: &[u8]) -> Vec<OpCode> {
-    let mut ops = measure!("compiling", BfCompiler::new(trim(code)).collect::<Vec<_>>());
-    measure!("optimizing", optimize(&mut ops));
-    ops
+pub fn compile(code: &[u8]) -> Measured<Vec<OpCode>> {
+    let mut m = Measured::new();
+    let mut ops = m.measure("compiling", || {
+        BfCompiler::new(trim(code)).collect::<Vec<_>>()
+    });
+    m.measure("optimizing", || optimize(&mut ops));
+    m.set(ops);
+    m
 }
 
 fn trim(input: &[u8]) -> &[u8] {

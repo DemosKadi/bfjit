@@ -7,6 +7,7 @@ mod scanner;
 use std::{
     io::{stdin, stdout, BufRead, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::{Parser, ValueEnum};
@@ -28,53 +29,41 @@ enum RunKind {
     CraneLift,
 }
 
-#[cfg(test)]
-#[macro_export]
-macro_rules! measure {
-    ($name:expr, $code: expr) => {
-        $code
-    };
-}
-
-#[cfg(not(test))]
-#[macro_export]
-macro_rules! measure {
-    ($name:expr, $code: expr) => {{
-        let now = std::time::Instant::now();
-        let ret = $code;
-
-        let duration = std::time::Instant::now().duration_since(now);
-        println!("{}: {duration:?}", $name);
-
-        ret
-    }};
-}
-
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let code = std::fs::read(args.path)?;
 
-    match args.run {
-        RunKind::Interpret => measure!(
-            "interpret",
-            run::<interpret::Interpreter>(&code, args.cells)
-        ),
+    let measurements = match args.run {
+        RunKind::Interpret => run::<interpret::Interpreter>(&code, args.cells),
         RunKind::Jit => run::<jit::Jit>(&code, args.cells),
         RunKind::CraneLift => run::<cljit::ClJit>(&code, args.cells),
+    };
+
+    for (name, duration) in &measurements.measurements {
+        println!("{name}: {duration:?}");
     }
+    println!(
+        "time: {:?}",
+        measurements
+            .measurements
+            .into_iter()
+            .map(|(_, d)| d)
+            .sum::<Duration>()
+    );
 
     Ok(())
 }
 
-fn run<T: Runner>(code: &[u8], cells: usize) {
-    let mut ops = compile::compile(code);
+fn run<T: Runner>(code: &[u8], cells: usize) -> Measured<()> {
+    let mut measured_ops = compile::compile(code);
+    let mut ops = measured_ops.data();
     let mut cells = vec![0u8; cells];
 
     let mut printer = make_printer();
     let mut scanner = make_scanner();
 
-    T::exec(&mut ops, &mut cells, &mut printer, &mut scanner);
+    measured_ops.append(T::exec(&mut ops, &mut cells, &mut printer, &mut scanner))
 }
 
 fn make_printer() -> Printer {
@@ -104,7 +93,12 @@ fn make_scanner() -> Scanner {
 }
 
 pub(crate) trait Runner {
-    fn exec(ops: &mut [OpCode], cells: &mut [u8], printer: &mut Printer, scanner: &mut Scanner);
+    fn exec(
+        ops: &mut [OpCode],
+        cells: &mut [u8],
+        printer: &mut Printer,
+        scanner: &mut Scanner,
+    ) -> Measured<()>;
 }
 
 pub(crate) type JitFunc = fn(*mut u8, *mut Printer, PrinterFunc, *mut Scanner, ScannerFunc);
@@ -145,35 +139,42 @@ pub(crate) extern "C" fn scanner_function(scanner: &mut Scanner) -> u8 {
 }
 pub(crate) type ScannerFunc = extern "C" fn(&mut Scanner) -> u8;
 
-#[cfg(test)]
-mod tests {
-    use crate::{compile, interpret_with_custom_io, run_jit_with_io};
+pub(crate) struct Measured<T> {
+    data: Option<T>,
+    measurements: Vec<(&'static str, std::time::Duration)>,
+}
 
-    #[test]
-    fn code_interpret() {
-        let code = b",++++++++++.";
-        let ops = compile(code);
-
-        let mut print_buffer = Vec::new();
-        interpret_with_custom_io(
-            &ops,
-            30000,
-            &mut |value| print_buffer.push(value),
-            &mut || 12,
-        );
+impl<T> Measured<T> {
+    pub fn new() -> Self {
+        Self {
+            data: None,
+            measurements: Vec::new(),
+        }
     }
 
-    #[test]
-    fn code_jit() {
-        let code = b",++++++++++.";
-        let ops = compile(code);
+    pub fn set(&mut self, data: T) {
+        self.data = Some(data);
+    }
 
-        let mut print_buffer = Vec::new();
-        run_jit_with_io(
-            &ops,
-            30000,
-            &mut |value| print_buffer.push(value),
-            &mut || 12,
-        );
+    pub fn measure<Ret>(&mut self, name: &'static str, func: impl FnOnce() -> Ret) -> Ret {
+        let now = std::time::Instant::now();
+        let ret = func();
+
+        self.measurements
+            .push((name, std::time::Instant::now().duration_since(now)));
+
+        ret
+    }
+
+    fn data(&mut self) -> T {
+        self.data.take().unwrap()
+    }
+
+    fn append<D>(mut self, other: Measured<D>) -> Measured<D> {
+        self.measurements.extend(other.measurements);
+        Measured {
+            data: other.data,
+            measurements: self.measurements,
+        }
     }
 }

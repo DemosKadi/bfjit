@@ -2,7 +2,7 @@ use cranelift::{codegen::ir::types::I8, prelude::*};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::{measure, printer_function, scanner::OpCode, scanner_function, JitFunc, Runner};
+use crate::{printer_function, scanner::OpCode, scanner_function, JitFunc, Measured, Runner};
 
 pub struct ClJit;
 
@@ -12,17 +12,18 @@ impl Runner for ClJit {
         cells: &mut [u8],
         printer: &mut crate::Printer,
         scanner: &mut crate::Scanner,
-    ) {
+    ) -> Measured<()> {
+        let mut m = Measured::new();
+
         let mut jit = Jit::new().unwrap();
 
-        let code = measure!("compile cranelift", jit.compile(ops).unwrap());
+        let code = m.measure("compile cranelift", || jit.compile(ops).unwrap());
 
         let func: JitFunc = unsafe { std::mem::transmute(code) };
         let printer = printer as *mut crate::Printer;
         let scanner = scanner as *mut crate::Scanner;
 
-        measure!(
-            "run cranelift",
+        m.measure("run cranelift", || {
             func(
                 cells.as_mut_ptr(),
                 printer,
@@ -30,7 +31,9 @@ impl Runner for ClJit {
                 scanner,
                 scanner_function,
             )
-        );
+        });
+
+        m
     }
 }
 
