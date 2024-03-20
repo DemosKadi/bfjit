@@ -42,12 +42,12 @@ impl:
     push rdi
 
     mov rdi, rcx
-    call qword[r8 + 32]
+    call r8
 
     pop rdi
     pop rbx
 
-    mov [rdi + rbx], al
+    ;mov [rdi + rbx], al
 
     pop rdx
     pop r8

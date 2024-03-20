@@ -9,10 +9,10 @@ clap = { version = "4.5.2", features = ["derive"] }
 libc = "0.2.153"
 memmap2 = "0.9.4"
 
-cranelift = "0.105"
-cranelift-module = "0.105"
-cranelift-jit = "0.105"
-cranelift-native = "0.105"
+cranelift = "0.106"
+cranelift-module = "0.106"
+cranelift-jit = {version = "0.106", features = ["selinux-fix"]}
+cranelift-native = "0.106"
 
 [profile.release]
 debug = true

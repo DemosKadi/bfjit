@@ -1,161 +1,231 @@
-use cranelift::{
-    codegen::{
-        ir::{types::I8, Function, UserFuncName},
-        Context,
-    },
-    prelude::*,
-};
+use cranelift::{codegen::ir::types::I8, prelude::*};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Linkage, Module};
 
-use crate::scanner::OpCode;
+use crate::{measure, printer_function, scanner::OpCode, scanner_function, JitFunc, Runner};
 
-pub fn compile(ops: &[OpCode]) -> anyhow::Result<Vec<u8>> {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    flag_builder.set("is_pic", "false").unwrap();
-    flag_builder.set("opt_level", "speed").unwrap();
+pub struct ClJit;
 
-    let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-        panic!("Host machine is not supported: {}", msg);
-    });
+impl Runner for ClJit {
+    fn exec(
+        ops: &mut [OpCode],
+        cells: &mut [u8],
+        printer: &mut crate::Printer,
+        scanner: &mut crate::Scanner,
+    ) {
+        let mut jit = Jit::new().unwrap();
 
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .unwrap();
+        let code = measure!("compile cranelift", jit.compile(ops).unwrap());
 
-    let mut sig = Signature::new(isa::CallConv::SystemV);
-    let pointer_type = isa.pointer_type();
-    let ptr_arg = AbiParam::new(pointer_type);
-    sig.params.extend([
-        ptr_arg, // array
-        ptr_arg, // print object
-        ptr_arg, // print trait
-        ptr_arg, // scan object
-        ptr_arg, // scan trait
-    ]);
+        let func: JitFunc = unsafe { std::mem::transmute(code) };
+        let printer = printer as *mut crate::Printer;
+        let scanner = scanner as *mut crate::Scanner;
 
-    let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        measure!(
+            "run cranelift",
+            func(
+                cells.as_mut_ptr(),
+                printer,
+                printer_function,
+                scanner,
+                scanner_function,
+            )
+        );
+    }
+}
 
-    let mut func_ctx = FunctionBuilderContext::new();
-    let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+struct Jit {
+    builder_context: FunctionBuilderContext,
+    ctx: codegen::Context,
+    module: JITModule,
+}
 
-    let cell_index = Variable::new(0);
-    builder.declare_var(cell_index, pointer_type);
+impl Jit {
+    fn new() -> anyhow::Result<Self> {
+        let mut flag_builder = settings::builder();
+        flag_builder.set("use_colocated_libcalls", "false")?;
+        flag_builder.set("is_pic", "false")?;
+        let isa_builder = match cranelift_native::builder() {
+            Ok(ok) => ok,
+            Err(e) => anyhow::bail!("host maschine is not supported: {e}"),
+        };
+        let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
-    let block = builder.create_block();
-    builder.seal_block(block);
+        let module = JITModule::new(builder);
 
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
+        Ok(Self {
+            builder_context: FunctionBuilderContext::new(),
+            ctx: module.make_context(),
+            module,
+        })
+    }
 
-    let cells = builder.block_params(block)[0];
+    fn compile(&mut self, ops: &[OpCode]) -> anyhow::Result<*const u8> {
+        self.translate(ops);
 
-    let (print_obj, print_func, print_func_ref) = print_function(&mut builder, block, ptr_arg);
-    let (scan_obj, scan_func, scan_func_ref) = scan_function(&mut builder, block, ptr_arg);
+        let id =
+            self.module
+                .declare_function("brainfuck", Linkage::Export, &self.ctx.func.signature)?;
 
-    let zero = builder.ins().iconst(pointer_type, 0);
-    builder.def_var(cell_index, zero);
+        self.module.define_function(id, &mut self.ctx)?;
+        self.module.clear_context(&mut self.ctx);
+        self.module.finalize_definitions()?;
+        Ok(self.module.get_finalized_function(id))
+    }
 
-    let mem_flags = MemFlags::new();
+    fn translate(&mut self, ops: &[OpCode]) {
+        let pointer_type = self.module.target_config().pointer_type();
+        let ptr_arg = AbiParam::new(pointer_type);
+        self.ctx.func.signature.params.extend([
+            ptr_arg, // cells
+            ptr_arg, // print object
+            ptr_arg, // print trait
+            ptr_arg, // scan object
+            ptr_arg, // scan trait
+        ]);
 
-    let mut stack = Vec::new();
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
 
-    let zero = builder.ins().iconst(I8, 0);
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
 
-    for op in ops {
+        let cells = builder.block_params(entry_block)[0];
+        let mut trans = OpTranslator::new(pointer_type, builder, cells, entry_block);
+        for op in ops {
+            trans.translate(*op);
+        }
+
+        trans.builder.ins().return_(&[]);
+        trans.builder.finalize();
+    }
+}
+
+struct OpTranslator<'a> {
+    ptr: types::Type,
+    builder: FunctionBuilder<'a>,
+    cell_index: Variable,
+    cells: Value,
+    mem_flags: MemFlags,
+    stack: Vec<(Block, Block)>,
+    block: Block,
+}
+
+impl<'a> OpTranslator<'a> {
+    fn new(ptr: types::Type, mut builder: FunctionBuilder<'a>, cells: Value, block: Block) -> Self {
+        let cell_index = Variable::new(0);
+        builder.declare_var(cell_index, ptr);
+        Self {
+            ptr,
+            builder,
+            cell_index,
+            cells,
+            mem_flags: MemFlags::new(),
+            stack: Vec::new(),
+            block,
+        }
+    }
+
+    fn translate(&mut self, op: OpCode) {
         match op {
             OpCode::Right { count } => {
-                let var = builder.use_var(cell_index);
-                let value = builder.ins().iadd_imm(var, *count as i64);
-                builder.def_var(cell_index, value);
+                let var = self.builder.use_var(self.cell_index);
+                let value = self.builder.ins().iadd_imm(var, count as i64);
+                self.builder.def_var(self.cell_index, value);
             }
             OpCode::Left { count } => {
-                let var = builder.use_var(cell_index);
-                let value = builder.ins().iadd_imm(var, -(*count as i64));
-                builder.def_var(cell_index, value);
+                let var = self.builder.use_var(self.cell_index);
+                let value = self.builder.ins().iadd_imm(var, -(count as i64));
+                self.builder.def_var(self.cell_index, value);
             }
             OpCode::Inc { count } => {
-                let (cell_index, current_cell) =
-                    get_current_cell(&mut builder, cell_index, cells, mem_flags);
-                let current_cell = builder.ins().iadd_imm(current_cell, *count as i64);
+                let (cell_index, current_cell) = self.get_current_cell();
+                let current_cell = self.builder.ins().iadd_imm(current_cell, count as i64);
 
-                builder.ins().store(mem_flags, current_cell, cell_index, 0);
+                self.builder
+                    .ins()
+                    .store(self.mem_flags, current_cell, cell_index, 0);
             }
             OpCode::Dec { count } => {
-                let (cell_index, current_cell) =
-                    get_current_cell(&mut builder, cell_index, cells, mem_flags);
-                let current_cell = builder.ins().iadd_imm(current_cell, -(*count as i64));
+                let (cell_index, current_cell) = self.get_current_cell();
+                let current_cell = self.builder.ins().iadd_imm(current_cell, -(count as i64));
 
-                builder.ins().store(mem_flags, current_cell, cell_index, 0);
+                self.builder
+                    .ins()
+                    .store(self.mem_flags, current_cell, cell_index, 0);
             }
             OpCode::Output => {
-                let (_, current_cell) =
-                    get_current_cell(&mut builder, cell_index, cells, mem_flags);
+                let (_, current_cell) = self.get_current_cell();
+                let (print_obj, print_func, print_func_ref) =
+                    print_function(&mut self.builder, self.block, AbiParam::new(self.ptr));
 
-                builder
-                    .ins()
-                    .call_indirect(print_func_ref, print_func, &[print_obj, current_cell]);
+                self.builder.ins().call_indirect(
+                    print_func_ref,
+                    print_func,
+                    &[print_obj, current_cell],
+                );
             }
             OpCode::Input => {
-                let rets = builder
+                let (scan_obj, scan_func, scan_func_ref) =
+                    scan_function(&mut self.builder, self.block, AbiParam::new(self.ptr));
+                let rets = self
+                    .builder
                     .ins()
                     .call_indirect(scan_func_ref, scan_func, &[scan_obj]);
-                let ret = builder.inst_results(rets)[0];
+                let ret = self.builder.inst_results(rets)[0];
 
-                let (cell_index, _) = get_current_cell(&mut builder, cell_index, cells, mem_flags);
+                let (cell_index, _) = self.get_current_cell();
 
-                builder.ins().store(mem_flags, ret, cell_index, 0);
+                self.builder.ins().store(self.mem_flags, ret, cell_index, 0);
             }
             OpCode::JumpIfZero { .. } => {
-                let block_if_not_zero = builder.create_block();
-                let block_if_zero = builder.create_block();
+                let block_if_not_zero = self.builder.create_block();
+                let block_if_zero = self.builder.create_block();
 
-                let (_, current_cell) =
-                    get_current_cell(&mut builder, cell_index, cells, mem_flags);
+                let (_, current_cell) = self.get_current_cell();
 
-                builder
+                self.builder
                     .ins()
                     .brif(current_cell, block_if_not_zero, &[], block_if_zero, &[]);
 
-                builder.switch_to_block(block_if_not_zero);
+                self.builder.switch_to_block(block_if_not_zero);
 
-                stack.push((block_if_not_zero, block_if_zero));
+                self.stack.push((block_if_not_zero, block_if_zero));
             }
             OpCode::JumpIfNotZero { .. } => {
-                let (block_if_not_zero, block_if_zero) = stack.pop().unwrap();
+                let (block_if_not_zero, block_if_zero) = self.stack.pop().unwrap();
 
-                let (_, current_cell) =
-                    get_current_cell(&mut builder, cell_index, cells, mem_flags);
-                builder
+                let (_, current_cell) = self.get_current_cell();
+                self.builder
                     .ins()
                     .brif(current_cell, block_if_not_zero, &[], block_if_zero, &[]);
 
-                builder.seal_block(block_if_zero);
-                builder.seal_block(block_if_not_zero);
+                self.builder.seal_block(block_if_zero);
+                self.builder.seal_block(block_if_not_zero);
 
-                builder.switch_to_block(block_if_zero);
+                self.builder.switch_to_block(block_if_zero);
             }
             OpCode::SetZero => {
-                let index = builder.use_var(cell_index);
-                let cell_index = builder.ins().iadd(cells, index);
-                builder.ins().store(mem_flags, zero, cell_index, 0);
+                let index = self.builder.use_var(self.cell_index);
+                let cell_index = self.builder.ins().iadd(self.cells, index);
+                let zero = self.builder.ins().iconst(I8, 0);
+                self.builder
+                    .ins()
+                    .store(self.mem_flags, zero, cell_index, 0);
             }
         }
     }
 
-    builder.ins().return_(&[]);
-
-    builder.finalize();
-
-    let mut ctx = Context::for_function(func);
-    ctx.set_disasm(true);
-    dbg!(&ctx.func);
-    ctx.verify(&*isa)?;
-    let code = match ctx.compile(&*isa, &mut Default::default()) {
-        Ok(x) => x,
-        Err(_) => anyhow::bail!("error while compiling"),
-    };
-
-    Ok(code.code_buffer().to_vec())
+    fn get_current_cell(&mut self) -> (Value, Value) {
+        get_current_cell(
+            &mut self.builder,
+            self.cell_index,
+            self.cells,
+            self.mem_flags,
+        )
+    }
 }
 
 fn scan_function(
@@ -164,8 +234,7 @@ fn scan_function(
     ptr_arg: AbiParam,
 ) -> (Value, Value, codegen::ir::SigRef) {
     let scan_obj = builder.block_params(block)[3];
-    let scan_trait = builder.block_params(block)[4];
-    let scan_func = builder.ins().iadd_imm(scan_trait, 32);
+    let scan_func = builder.block_params(block)[4];
     let mut scan_signature = Signature::new(isa::CallConv::SystemV);
     scan_signature.params.push(ptr_arg);
     scan_signature.returns.push(AbiParam::new(I8));
@@ -179,8 +248,7 @@ fn print_function(
     ptr_arg: AbiParam,
 ) -> (Value, Value, codegen::ir::SigRef) {
     let print_obj = builder.block_params(block)[1];
-    let print_trait = builder.block_params(block)[2];
-    let print_func = builder.ins().iadd_imm(print_trait, 32);
+    let print_func = builder.block_params(block)[2];
     let mut print_signature = Signature::new(isa::CallConv::SystemV);
     print_signature.params.extend([ptr_arg, AbiParam::new(I8)]);
     let print_func_ref = builder.import_signature(print_signature);
