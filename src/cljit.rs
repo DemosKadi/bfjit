@@ -2,9 +2,37 @@ use cranelift::{codegen::ir::types::I8, prelude::*};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::{printer_function, scanner::OpCode, scanner_function, JitFunc, Measured, Runner};
+use crate::{compile::OpCode, printer_function, scanner_function, JitFunc, Measured, Runner};
 
-pub struct ClJit;
+pub struct ClJit {
+    #[allow(dead_code)]
+    jit: Jit, // has ownership of code
+    code: *const u8,
+}
+
+impl ClJit {
+    fn compile(ops: &mut [OpCode]) -> Self {
+        let mut jit = Jit::new().unwrap();
+        Self {
+            code: jit.compile(ops).unwrap(),
+            jit,
+        }
+    }
+
+    fn run(&self, cells: &mut [u8], printer: &mut crate::Printer, scanner: &mut crate::Scanner) {
+        let func: JitFunc = unsafe { std::mem::transmute(self.code) };
+        let printer = printer as *mut crate::Printer;
+        let scanner = scanner as *mut crate::Scanner;
+
+        func(
+            cells.as_mut_ptr(),
+            printer,
+            printer_function,
+            scanner,
+            scanner_function,
+        );
+    }
+}
 
 impl Runner for ClJit {
     fn exec(
@@ -12,26 +40,26 @@ impl Runner for ClJit {
         cells: &mut [u8],
         printer: &mut crate::Printer,
         scanner: &mut crate::Scanner,
+    ) {
+        ClJit::compile(ops).run(cells, printer, scanner);
+    }
+
+    fn exec_bench(
+        ops: &mut [OpCode],
+        cells: &mut [u8],
+        printer: &mut crate::Printer,
+        scanner: &mut crate::Scanner,
+        count: usize,
     ) -> Measured<()> {
         let mut m = Measured::new();
 
-        let mut jit = Jit::new().unwrap();
+        let cljit = m.measure("compile cranelift", || ClJit::compile(ops));
 
-        let code = m.measure("compile cranelift", || jit.compile(ops).unwrap());
-
-        let func: JitFunc = unsafe { std::mem::transmute(code) };
-        let printer = printer as *mut crate::Printer;
-        let scanner = scanner as *mut crate::Scanner;
-
-        m.measure("run cranelift", || {
-            func(
-                cells.as_mut_ptr(),
-                printer,
-                printer_function,
-                scanner,
-                scanner_function,
-            )
-        });
+        for i in 0..count {
+            m.measure(format!("cranelift {i}"), || {
+                cljit.run(cells, printer, scanner);
+            });
+        }
 
         m
     }
@@ -72,6 +100,14 @@ impl Jit {
                 .declare_function("brainfuck", Linkage::Export, &self.ctx.func.signature)?;
 
         self.module.define_function(id, &mut self.ctx)?;
+
+        /*
+        // Print the IR
+        let mut func_buf = String::new();
+        write_function(&mut func_buf, &self.ctx.func).unwrap();
+        println!("{func_buf}");
+        */
+
         self.module.clear_context(&mut self.ctx);
         self.module.finalize_definitions()?;
         Ok(self.module.get_finalized_function(id))
@@ -143,16 +179,16 @@ impl<'a> OpTranslator<'a> {
                 let value = self.builder.ins().iadd_imm(var, -(count as i64));
                 self.builder.def_var(self.cell_index, value);
             }
-            OpCode::Inc { count } => {
-                let (cell_index, current_cell) = self.get_current_cell();
+            OpCode::Inc { count, offset } => {
+                let (cell_index, current_cell) = self.get_current_cell_with_offset(offset);
                 let current_cell = self.builder.ins().iadd_imm(current_cell, count as i64);
 
                 self.builder
                     .ins()
                     .store(self.mem_flags, current_cell, cell_index, 0);
             }
-            OpCode::Dec { count } => {
-                let (cell_index, current_cell) = self.get_current_cell();
+            OpCode::Dec { count, offset } => {
+                let (cell_index, current_cell) = self.get_current_cell_with_offset(offset);
                 let current_cell = self.builder.ins().iadd_imm(current_cell, -(count as i64));
 
                 self.builder
@@ -218,6 +254,20 @@ impl<'a> OpTranslator<'a> {
                     .ins()
                     .store(self.mem_flags, zero, cell_index, 0);
             }
+            OpCode::Mul { factor, offset } => {
+                let (cell_index, current_cell) = self.get_current_cell();
+                let (dest_index, dest_cell) = self.get_current_cell_with_offset(offset);
+                let add_to_dest_cell = self.builder.ins().imul_imm(current_cell, factor as i64);
+                let dest_cell = self.builder.ins().iadd(dest_cell, add_to_dest_cell);
+                let zero = self.builder.ins().iconst(I8, 0);
+
+                self.builder
+                    .ins()
+                    .store(self.mem_flags, zero, cell_index, 0);
+                self.builder
+                    .ins()
+                    .store(self.mem_flags, dest_cell, dest_index, 0);
+            }
         }
     }
 
@@ -227,6 +277,16 @@ impl<'a> OpTranslator<'a> {
             self.cell_index,
             self.cells,
             self.mem_flags,
+        )
+    }
+
+    fn get_current_cell_with_offset(&mut self, offset: i32) -> (Value, Value) {
+        get_current_cell_with_offset(
+            &mut self.builder,
+            self.cell_index,
+            self.cells,
+            self.mem_flags,
+            offset,
         )
     }
 }
@@ -267,6 +327,21 @@ fn get_current_cell(
 ) -> (Value, Value) {
     let index = builder.use_var(cell_index);
     let cell_index = builder.ins().iadd(cells, index);
+    let current_cell = builder.ins().load(I8, mem_flags, cell_index, 0);
+    (cell_index, current_cell)
+}
+///
+/// returns (cell_index, current_cell)
+fn get_current_cell_with_offset(
+    builder: &mut FunctionBuilder<'_>,
+    cell_index: Variable,
+    cells: Value,
+    mem_flags: MemFlags,
+    offset: i32,
+) -> (Value, Value) {
+    let index = builder.use_var(cell_index);
+    let cell_index = builder.ins().iadd(cells, index);
+    let cell_index = builder.ins().iadd_imm(cell_index, offset as i64);
     let current_cell = builder.ins().load(I8, mem_flags, cell_index, 0);
     (cell_index, current_cell)
 }
